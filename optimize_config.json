@@ -1,0 +1,37 @@
+{
+    "base_params":  "parameter_logits_big.json",
+    "study_name":   "synful_opt_v1",
+    "output_dir":   "optimization_runs",
+    "n_trials":     20,
+
+    "warmup_iters":   300000,
+    "eval_interval":  100000,
+    "max_iters":      700000,
+
+    "device_num":  1,
+    "python":      "python",
+
+    "eval_cubes": [
+        {
+            "zarr":        "/path/to/eval_cube_1.zarr",
+            "raw_dataset": "RAW",
+            "pre_csv":     "/path/to/eval_cube_1_pre.csv",
+            "post_csv":    "/path/to/eval_cube_1_post.csv",
+            "tolerance_vox": 5.0
+        },
+        {
+            "zarr":        "/path/to/eval_cube_2.zarr",
+            "raw_dataset": "RAW",
+            "pre_csv":     "/path/to/eval_cube_2_pre.csv",
+            "post_csv":    "/path/to/eval_cube_2_post.csv",
+            "tolerance_vox": 5.0
+        },
+        {
+            "zarr":        "/path/to/eval_cube_3.zarr",
+            "raw_dataset": "RAW",
+            "pre_csv":     "/path/to/eval_cube_3_pre.csv",
+            "post_csv":    "/path/to/eval_cube_3_post.csv",
+            "tolerance_vox": 5.0
+        }
+    ]
+}
