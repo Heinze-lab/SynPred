@@ -43,12 +43,6 @@ pip install \
     daisy==1.0
 ```
 
-## Pipeline
-
-```
-predict.py → extract_daisy.py 
-```
-
 ## Key files
 
 | File | Purpose |
