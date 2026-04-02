@@ -70,7 +70,7 @@ predict.py → extract_daisy.py
 
 ## Parameter files
 
-- `parameter_small_blob_8.json` — Example parameter JSON with all options annotated
+- `param_template.json` — Template parameter JSON with all options and placeholder paths
 
 ---
 
@@ -87,10 +87,12 @@ Each volume must have a `RAW` dataset (3D or 4D with a leading channel dim):
     RAW          # uint8 or float32, shape (Z, Y, X) or (1, Z, Y, X)
         attrs:
             offset:     [z, y, x]   # world-space origin of this volume in voxels
-            resolution: [1, 1, 1]   # voxel size; offset is divided by this if != 1
+            resolution: [z, y, x]   # voxel size per axis; offset is divided by this if != 1
 ```
 
-The `offset` attribute is required for correct coordinate mapping. If absent, `[0,0,0]` is assumed and CSV coordinates must be volume-local.
+All coordinates throughout the pipeline are in **Z, Y, X order** — this applies to the zarr `offset` and `resolution` attrs, the CSV synapse coordinates, and all shape/size parameters in the JSON (`input_size`, `blob_radius`, `voxel_size`, etc.).
+
+The `offset` attribute is required for correct coordinate mapping between the CSV world coordinates and the local voxel positions within each crop. If absent, `[0, 0, 0]` is assumed and CSV coordinates must be volume-local.
 
 ### CSV files
 
@@ -102,7 +104,7 @@ csv_dir/
     {name}_post.csv   # postsynaptic (dendrite) site coordinates
 ```
 
-Format — no header, three columns, comma-delimited, **absolute world voxel coordinates (z, y, x)**:
+Format — no header, three columns, comma-delimited, **absolute world voxel coordinates in Z, Y, X order**:
 
 ```
 1600,18739,20170
