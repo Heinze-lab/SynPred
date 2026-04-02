@@ -263,6 +263,9 @@ def train(params_path: str) -> None:
     d_scale     = float(params.get("d_loss_scale", 1.0))
     comb_type   = params.get("loss_comb_type", "sum")
     focal_gamma = float(params.get("focal_gamma", 2.0))
+    # Optional gamma schedule: ramp to a new gamma value at a given iteration.
+    # Config: "focal_gamma_schedule": {"step": 425000, "gamma": 1.0}
+    _gamma_schedule = params.get("focal_gamma_schedule", None)
     _cw = params.get("vec_channel_weights", [1.0, 1.0, 1.0])
     channel_weights = torch.tensor(_cw, dtype=torch.float32).to(device)
     normalize_by_magnitude = bool(params.get("vec_normalize_by_magnitude", False))
@@ -295,6 +298,12 @@ def train(params_path: str) -> None:
         t_mask   = batch["indicator_mask"].to(device, non_blocking=True)
         t_vec    = batch["direction_vectors"].to(device, non_blocking=True)
         d_weight = batch["d_weight_mask"].to(device, non_blocking=True)
+
+        # Apply gamma schedule if configured
+        if _gamma_schedule and iteration == _gamma_schedule["step"]:
+            focal_gamma = float(_gamma_schedule["gamma"])
+            print(f"[train] focal_gamma → {focal_gamma} at iteration {iteration}")
+            writer.add_scalar("focal_gamma", focal_gamma, iteration)
 
         optimizer.zero_grad(set_to_none=True)
 

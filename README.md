@@ -1,5 +1,5 @@
 # Synaptic Partner Detection - rewrite of [Synful](https://github.com/funkelab/synful)
-This is a (mostly) TensorFlow implementation of the dual-headed UNET architecture from Synful. Complete with model architecture, augmentations, and pulling from data. This is so far only tested with zarr files. 
+PyTorch reimplementation of the dual-headed U-Net architecture from Synful, with a pure PyTorch training stack (no gunpowder dependency). Tested with zarr volumes.
 
 Training, prediction, and extraction pipeline for synapse detection and partner vector prediction.
 
@@ -43,6 +43,12 @@ pip install \
     daisy==1.0
 ```
 
+## Pipeline
+
+```
+predict.py → extract_daisy.py 
+```
+
 ## Key files
 
 | File | Purpose |
@@ -64,4 +70,58 @@ pip install \
 
 ## Parameter files
 
-- `param_template.json` — Parameter input JSON
+- `parameter_small_blob_8.json` — Example parameter JSON with all options annotated
+
+---
+
+## Ground truth data format
+
+Training requires one zarr volume and two CSV files per training sample.
+
+### Zarr volumes
+
+Each volume must have a `RAW` dataset (3D or 4D with a leading channel dim):
+
+```
+{name}.zarr/
+    RAW          # uint8 or float32, shape (Z, Y, X) or (1, Z, Y, X)
+        attrs:
+            offset:     [z, y, x]   # world-space origin of this volume in voxels
+            resolution: [1, 1, 1]   # voxel size; offset is divided by this if != 1
+```
+
+The `offset` attribute is required for correct coordinate mapping. If absent, `[0,0,0]` is assumed and CSV coordinates must be volume-local.
+
+### CSV files
+
+Two files per zarr, placed in the same directory (`csv_dir` in the parameter JSON), named by the zarr stem:
+
+```
+csv_dir/
+    {name}_pre.csv    # presynaptic (axon) site coordinates
+    {name}_post.csv   # postsynaptic (dendrite) site coordinates
+```
+
+Format — no header, three columns, comma-delimited, **absolute world voxel coordinates (z, y, x)**:
+
+```
+1600,18739,20170
+1600,18739,20173
+1600,18743,20171
+```
+
+Row `i` in `_pre.csv` is the presynaptic partner of row `i` in `_post.csv`. The files must have equal row counts. Both files must exist even if empty (empty = volume has no annotated synapses and will not be used for positive sampling).
+
+### Naming convention
+
+Zarr stem must follow `{species}_{region}_{index}` (e.g. `megalopta_FB_1`). The first underscore-delimited token is used as the species identifier for the optional `species` filter in the parameter JSON.
+
+### Parameter JSON fields
+
+```json
+"zarr_locs": ["/path/to/megalopta_FB_1.zarr", ...],
+"csv_dir":   "/path/to/csvs",
+"voxel_size": [1, 1, 1]
+```
+
+`json_dir` is accepted but currently unused — ROIs always default to the full zarr extent.
