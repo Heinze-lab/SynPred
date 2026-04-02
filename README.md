@@ -76,7 +76,7 @@ predict.py → extract_daisy.py
 
 ## Ground truth data format
 
-Training requires one zarr volume and two CSV files per training sample.
+Training requires one zarr volume and two CSV files per training sample. Recommended that the zarr volume is at least 25 pixels larger in z on both sizes and100 pixels larger in both y and x on both sides, but these may change depending your input size. 
 
 ### Zarr volumes
 
@@ -86,8 +86,8 @@ Each volume must have a `RAW` dataset (3D or 4D with a leading channel dim):
 {name}.zarr/
     RAW          # uint8 or float32, shape (Z, Y, X) or (1, Z, Y, X)
         attrs:
-            offset:     [z, y, x]   # world-space origin of this volume in voxels
-            resolution: [z, y, x]   # voxel size per axis; offset is divided by this if != 1
+            offset:     [1550,18500,20050]   # world-space origin (z,y,x order) of this volume in voxels, e.g. 
+            resolution: [1, 1, 1]            # voxel size per axis (z,y,x order); offset is divided by this if != 1
 ```
 
 All coordinates throughout the pipeline are in **Z, Y, X order** — this applies to the zarr `offset` and `resolution` attrs, the CSV synapse coordinates, and all shape/size parameters in the JSON (`input_size`, `blob_radius`, `voxel_size`, etc.).
@@ -116,12 +116,12 @@ Row `i` in `_pre.csv` is the presynaptic partner of row `i` in `_post.csv`. The 
 
 ### Naming convention
 
-Zarr stem must follow `{species}_{region}_{index}` (e.g. `megalopta_FB_1`). The first underscore-delimited token is used as the species identifier for the optional `species` filter in the parameter JSON.
+Zarr stem must follow `{species}_{region}_{index}` (e.g. `drosophila_FB_1`). The first underscore-delimited token is used as the species identifier for the optional `species` filter in the parameter JSON.
 
 ### Parameter JSON fields
 
 ```json
-"zarr_locs": ["/path/to/megalopta_FB_1.zarr", ...],
+"zarr_locs": ["/path/to/drosophila_FB_1.zarr", ...],
 "csv_dir":   "/path/to/csvs",
 "voxel_size": [1, 1, 1]
 ```
