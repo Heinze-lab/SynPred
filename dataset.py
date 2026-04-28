@@ -352,6 +352,7 @@ class SynfulDataset(Dataset):
         self.voxel_size    = list(params.get("voxel_size", [1, 1, 1]))
         self.gt_vec_scale  = np.array(params.get("gt_vec_scale", [1, 1, 1]), dtype=np.float32)
         self.delimiter     = params.get("csv_delimiter", ",")
+        self.gpu_elastic   = bool(params.get("gpu_elastic", False))
 
         # p_nonempty mirrors train_gb.py: 0.95 when has_synapses, 0 otherwise
         self.p_nonempty = float(params.get(
@@ -375,6 +376,21 @@ class SynfulDataset(Dataset):
                 print(f"[dataset] WARNING: cannot open {s.zarr_path}: {exc}")
                 self._stores.append(None)
 
+        # Cache all synapse points up-front — reading CSV per __getitem__ causes
+        # thousands of redundant disk reads across workers (one per training sample).
+        self._post_points: List[Optional[np.ndarray]] = []
+        self._pre_points:  List[Optional[np.ndarray]] = []
+        for s in self.samples:
+            if s.has_synapses:
+                self._post_points.append(load_points_csv(s.post_csv, self.delimiter))
+                self._pre_points.append(load_points_csv(s.pre_csv,  self.delimiter))
+            else:
+                self._post_points.append(np.zeros((0, 3), dtype=np.float32))
+                self._pre_points.append(np.zeros((0, 3), dtype=np.float32))
+
+        w = np.array([4.0 if s.has_synapses else 1.0 for s in self.samples])
+        self._sample_weights = w / w.sum()
+
     def __len__(self) -> int:
         return self.samples_per_epoch
 
@@ -385,10 +401,7 @@ class SynfulDataset(Dataset):
                 return result
 
     def _draw_sample(self) -> Optional[Dict[str, torch.Tensor]]:
-        # weighted: samples with synapses drawn 4× more often
-        weights = np.array([4.0 if s.has_synapses else 1.0 for s in self.samples])
-        weights /= weights.sum()
-        idx    = np.random.choice(len(self.samples), p=weights)
+        idx = np.random.choice(len(self.samples), p=self._sample_weights)
         sample = self.samples[idx]
         store  = self._stores[idx]
 
@@ -439,8 +452,8 @@ class SynfulDataset(Dataset):
         pre_locs   = np.zeros((0, 3), dtype=np.float32)
 
         if sample.has_synapses:
-            post_abs = load_points_csv(sample.post_csv, self.delimiter)
-            pre_abs  = load_points_csv(sample.pre_csv,  self.delimiter)
+            post_abs = self._post_points[idx]
+            pre_abs  = self._pre_points[idx]
 
             if len(post_abs) > 0 and len(pre_abs) > 0:
                 if len(post_abs) != len(pre_abs):
@@ -474,14 +487,25 @@ class SynfulDataset(Dataset):
         )
         vectors = vectors * self.gt_vec_scale[:, None, None, None]
 
-        # augmentation — elastic step crops back to input_size using real context
+        # augmentation — elastic step crops back to input_size using real context.
+        # When gpu_elastic=True, elastic is deferred to the training loop (faster);
+        # the context border is stripped here manually instead.
         if self.augment:
+            aug_ctx = "defer" if self.gpu_elastic else ctx
             raw_crop, indicator, vectors, d_weight = augment_sample(
-                raw_crop, indicator, vectors, d_weight, self.params, context=ctx
+                raw_crop, indicator, vectors, d_weight, self.params, context=aug_ctx
             )
+            if self.gpu_elastic:
+                # elastic was deferred — strip context border now.
+                # augment_sample already applied intensity_scale_shift ([0,1]→[-1,1]),
+                # so do NOT re-apply the *2-1 normalisation here.
+                raw_crop  = raw_crop[inner_sl]
+                indicator = indicator[inner_sl]
+                d_weight  = d_weight[inner_sl]
+                vectors   = vectors[(slice(None),) + inner_sl]
         else:
-            # no augmentation: just center-crop to input_size and normalise
-            raw_crop  = raw_crop[inner_sl]  * 2.0 - 1.0
+            # no augmentation: center-crop to input_size and normalise [0,1]→[-1,1]
+            raw_crop  = raw_crop[inner_sl] * 2.0 - 1.0
             indicator = indicator[inner_sl]
             d_weight  = d_weight[inner_sl]
             vectors   = vectors[(slice(None),) + inner_sl]

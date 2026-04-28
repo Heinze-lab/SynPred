@@ -82,8 +82,7 @@ row('render indicator mask', ms_ind, f'({in_crop.sum()} synapses)')
 _, ms_vec = T(render_direction_vectors, ls_t, post_loc, pre_loc, params['d_blob_radius'])
 row('render direction vecs', ms_vec)
 
-ind_ctx, _ = render_syn_indicators(ls_t, post_loc, params['blob_radius']), None
-ind_ctx    = render_syn_indicators(ls_t, post_loc, params['blob_radius'])
+ind_ctx = render_syn_indicators(ls_t, post_loc, params['blob_radius'])
 vec_ctx, dw_ctx = render_direction_vectors(ls_t, post_loc, pre_loc, params['d_blob_radius'])
 
 # helpers to get per-aug config

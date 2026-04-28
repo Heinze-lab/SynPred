@@ -97,12 +97,15 @@ def extract_block(
     world_origin_nm = zarr_offset + read_offset_nm
     vs = voxel_size  # ZYX nm/voxel
 
+    arr_shape = np.array(ind_ds.shape)
+
     def roi_to_slices(roi):
         offset_vx = ((np.array(roi.offset) - world_origin_nm) / vs).astype(int)
         shape_vx  = (np.array(roi.shape) / vs).astype(int)
-        # clamp to valid array bounds
-        offset_vx = np.maximum(offset_vx, 0)
-        return tuple(slice(int(o), int(o + s)) for o, s in zip(offset_vx, shape_vx))
+        # clamp both start and end to valid array bounds
+        start = np.maximum(offset_vx, 0)
+        end   = np.minimum(offset_vx + shape_vx, arr_shape)
+        return tuple(slice(int(s), int(e)) for s, e in zip(start, end))
 
     read_sl  = roi_to_slices(read_roi)
     write_sl = roi_to_slices(write_roi)
