@@ -12,6 +12,7 @@ Driven entirely by the parameter JSON:
 from __future__ import annotations
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from typing import List, Tuple
 
 
@@ -68,8 +69,10 @@ class UNetEncoder(nn.Module):
         downsample_factors: List[List[int]],
         kernel_size: int = 3,
         norm_type: str = "group",
+        use_checkpoint: bool = False,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         n_levels = len(downsample_factors) + 1
         self.fmaps: List[int] = [
             int(fmap_num * (fmap_inc_factor ** i)) for i in range(n_levels)
@@ -92,7 +95,10 @@ class UNetEncoder(nn.Module):
         """Returns (bottleneck_features, [skip_0, skip_1, …]) fine→coarse."""
         skips: List[torch.Tensor] = []
         for i, conv in enumerate(self.conv_blocks):
-            x = conv(x)
+            if self.use_checkpoint:
+                x = checkpoint(conv, x, use_reentrant=False)
+            else:
+                x = conv(x)
             if i < len(self.pools):
                 skips.append(x)
                 x = self.pools[i](x)
@@ -115,8 +121,10 @@ class UNetDecoder(nn.Module):
         downsample_factors: List[List[int]],
         kernel_size: int = 3,
         norm_type: str = "group",
+        use_checkpoint: bool = False,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         n_levels = len(downsample_factors)
         self.upsamples = nn.ModuleList()
         self.conv_blocks = nn.ModuleList()
@@ -145,7 +153,10 @@ class UNetDecoder(nn.Module):
             x = up(x)
             skip = self._center_crop(skip, x)
             x = torch.cat([x, skip], dim=1)
-            x = conv(x)
+            if self.use_checkpoint:
+                x = checkpoint(conv, x, use_reentrant=False)
+            else:
+                x = conv(x)
         return x
 
     @staticmethod
@@ -182,18 +193,20 @@ class DHUNet(nn.Module):
         downsample_factors: List[List[int]] | None = None,
         kernel_size: int = 3,
         norm_type: str = "group",
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         if downsample_factors is None:
             downsample_factors = [[1, 3, 3], [1, 3, 3], [3, 3, 3]]
 
         self.encoder = UNetEncoder(
-            in_channels, fmap_num, fmap_inc_factor, downsample_factors, kernel_size, norm_type
+            in_channels, fmap_num, fmap_inc_factor, downsample_factors, kernel_size, norm_type,
+            use_checkpoint=use_checkpoint,
         )
         fmaps = self.encoder.fmaps
 
-        self.mask_decoder = UNetDecoder(fmaps, downsample_factors, kernel_size, norm_type)
-        self.vec_decoder = UNetDecoder(fmaps, downsample_factors, kernel_size, norm_type)
+        self.mask_decoder = UNetDecoder(fmaps, downsample_factors, kernel_size, norm_type, use_checkpoint)
+        self.vec_decoder  = UNetDecoder(fmaps, downsample_factors, kernel_size, norm_type, use_checkpoint)
 
         # Output heads
         self.mask_head = nn.Conv3d(fmaps[0], 1, kernel_size=1)  # raw logits, no sigmoid
@@ -221,4 +234,5 @@ def build_model(params: dict) -> DHUNet:
         downsample_factors=params["downsample_factors"],
         kernel_size=params.get("kernel_size", 3),
         norm_type=params.get("norm_type", "group"),
+        use_checkpoint=params.get("grad_checkpoint", False),
     )

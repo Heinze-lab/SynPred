@@ -21,6 +21,7 @@ Add to params["predict"]:
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import queue
@@ -48,7 +49,10 @@ def load_model(params, predict_cfg, device):
     ckpt_path  = os.path.join(ckpt_dir, f"{model_name}_checkpoint_{ckpt_num}.pt")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    mtime = os.path.getmtime(ckpt_path)
+    created = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[predict] Loading checkpoint: {ckpt_path}")
+    print(f"[predict] Checkpoint saved:   {created}")
     state = torch.load(ckpt_path, map_location="cpu")
     sd    = state["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in sd):
@@ -129,7 +133,6 @@ def read_block(raw_ds, geom, input_size):
     out_off, out_size, in_off_c, in_end_c, in_off_abs, in_end_abs = geom
     sl  = tuple(slice(int(in_off_c[i]), int(in_end_c[i])) for i in range(3))
     raw = (raw_ds[sl] if raw_ds.ndim == 3 else raw_ds[0][sl]).astype(np.float32)
-    raw = normalise(raw)
 
     pad_before = (in_off_c - in_off_abs).astype(int)
     pad_after  = np.maximum((in_end_abs - in_end_c).astype(int), 0)
@@ -140,10 +143,13 @@ def read_block(raw_ds, geom, input_size):
     # guarantee exact input_size — boundary blocks may be slightly off
     raw = raw[:input_size[0], :input_size[1], :input_size[2]]
     if raw.shape != tuple(input_size):
-        # pad any remaining shortfall (e.g. volume smaller than input_size)
         shortfall = [(0, max(0, input_size[i] - raw.shape[i])) for i in range(3)]
         raw = np.pad(raw, shortfall, mode="reflect")
         raw = raw[:input_size[0], :input_size[1], :input_size[2]]
+
+    # normalise after padding so statistics are always from the full input_size region,
+    # matching training where normalisation is over the full loaded crop
+    raw = normalise(raw)
 
     return out_off, out_size, raw
 
@@ -165,42 +171,67 @@ def reader_worker(raw_ds, vol_full, read_off, read_sh, input_size,
     total   = int(np.prod(n_blocks))
     pending = []   # accumulate blocks for current batch
 
-    with ThreadPoolExecutor(max_workers=max(1, batch_size)) as pool:
-        futures = []
-        for flat_idx in range(total):
-            blk_idx = np.array(np.unravel_index(flat_idx, n_blocks), dtype=int)
-            if blocks_done_arr[tuple(blk_idx)]:
-                continue
+    num_read_workers = max(batch_size * 4, 16)
+    with ThreadPoolExecutor(max_workers=num_read_workers) as pool:
+        from collections import deque
+        import time as _time2
 
-            geom = block_input_slice(blk_idx, output_size, read_off,
-                                     read_sh, context, vol_full)
-            if geom is None:
-                continue
+        # Sliding window: keep exactly num_read_workers futures in flight.
+        # Collect via result_q so completed futures are picked up immediately
+        # without blocking on any specific future.
+        result_q = queue.Queue()
 
-            futures.append(pool.submit(read_block, raw_ds, geom, input_size))
+        def _wrapped_read(raw_ds, geom, input_size):
+            result = read_block(raw_ds, geom, input_size)
+            result_q.put(result)
 
-            if len(futures) >= batch_size:
-                # wait for this batch then push to queue
-                results = [f.result() for f in futures]
-                futures = []
-                # backpressure — wait if GPU is falling behind
+        idx_iter = iter(range(total))
+        in_flight = 0
+
+        def _try_submit():
+            nonlocal in_flight
+            for flat_idx in idx_iter:
+                blk_idx = np.array(np.unravel_index(flat_idx, n_blocks), dtype=int)
+                if blocks_done_arr[tuple(blk_idx)]:
+                    continue
+                geom = block_input_slice(blk_idx, output_size, read_off,
+                                         read_sh, context, vol_full)
+                if geom is None:
+                    continue
+                pool.submit(_wrapped_read, raw_ds, geom, input_size)
+                in_flight += 1
+                return True
+            return False
+
+        # Pre-fill
+        for _ in range(num_read_workers):
+            if not _try_submit():
+                break
+
+        batch = []
+        while in_flight > 0:
+            result = result_q.get()
+            in_flight -= 1
+            _try_submit()  # immediately replace with next job
+            batch.append(result)
+            if len(batch) >= batch_size:
                 while read_q.qsize() >= prefetch:
-                    import time; time.sleep(0.005)
-                read_q.put(([r[0] for r in results],
-                             [r[1] for r in results],
+                    _time2.sleep(0.005)
+                read_q.put(([r[0] for r in batch],
+                             [r[1] for r in batch],
                              torch.from_numpy(
-                                 np.stack([r[2] for r in results])[:, None]
+                                 np.stack([r[2] for r in batch])[:, None]
                              ).pin_memory()))
+                batch = []
 
-        # flush remaining partial batch
-        if futures:
-            results = [f.result() for f in futures]
+        # flush partial batch
+        if batch:
             while read_q.qsize() >= prefetch:
-                import time; time.sleep(0.005)
-            read_q.put(([r[0] for r in results],
-                         [r[1] for r in results],
+                _time2.sleep(0.005)
+            read_q.put(([r[0] for r in batch],
+                         [r[1] for r in batch],
                          torch.from_numpy(
-                             np.stack([r[2] for r in results])[:, None]
+                             np.stack([r[2] for r in batch])[:, None]
                          ).pin_memory()))
 
     read_q.put(_SENTINEL)
@@ -323,7 +354,7 @@ def predict_blockwise(params_path: str) -> None:
     print(f"[predict] batch_size={batch_size}  prefetch={prefetch}  amp={use_amp}")
 
     read_q  = queue.Queue(maxsize=prefetch)
-    write_q = queue.Queue(maxsize=prefetch)
+    write_q = queue.Queue()  # unbounded — writer must never stall the GPU
 
     reader = threading.Thread(
         target=reader_worker,
@@ -342,9 +373,14 @@ def predict_blockwise(params_path: str) -> None:
 
     pbar = tqdm(total=n_pending, desc="Predicting", unit="blocks")
 
+    import time as _time
+    _t_last = _time.perf_counter()
+
     with torch.no_grad():
         while True:
+            _t0 = _time.perf_counter()
             item = read_q.get()
+            _t_wait = _time.perf_counter() - _t0
             if item is _SENTINEL:
                 break
 
@@ -353,8 +389,10 @@ def predict_blockwise(params_path: str) -> None:
 
             raw_t = raw_stack.to(device, non_blocking=True)
 
+            _t1 = _time.perf_counter()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 pred_mask_t, pred_vec_t = model(raw_t)
+            _t_gpu = _time.perf_counter() - _t1
 
             # compute context from actual model output size (U-Net convolutions
             # reduce spatial dims, so actual output != input - 2*context)
@@ -377,6 +415,10 @@ def predict_blockwise(params_path: str) -> None:
 
             write_q.put((out_offs, out_sizes, masks_np, vecs_np))
             pbar.update(B)
+
+            _t_now = _time.perf_counter()
+            if _t_wait > 0.1:  # only log when we actually stalled
+                print(f"\n[timing] read_wait={_t_wait:.3f}s  gpu={_t_gpu:.3f}s  qsize={read_q.qsize()}  B={B}")
 
     write_q.put(_SENTINEL)
     writer.join()
