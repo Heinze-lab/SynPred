@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+
+# IDE / tooling
+.vscode/
+.ipynb_checkpoints/
+.claude/
+
+# Training outputs
+snapshots_*/
+tensorboard_*/
+daisy_logs/
+
+# Prediction outputs
+*.zarr/
+
+# Result CSVs and JSONs (not config files)
+megalopta_*.csv
+megalopta_*.json
+logits_big_*.csv
+logits_big_*.json
+logits_big_*.zarr/
+eciton_*.csv
+eciton_*.json
+cave_root_ids.csv
+PB2_v*.csv
+
+# Experiment-specific configs
+optimize_config.json
+parameter_*.json
+
+# Scratch / unnamed result files
+.csv
+
+# Downstream pipeline (not part of core model)
+match_to_roots/
+
+# Exploratory notebooks (not part of core pipeline)
+inspect.ipynb
+look_out.ipynb
+view_out.ipynb

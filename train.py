@@ -12,6 +12,9 @@ import math
 import os
 import sys
 
+# Reduce CUDA allocator fragmentation — must be set before any CUDA allocation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import h5py
 import numpy as np
 import torch
@@ -26,6 +29,7 @@ torch.set_float32_matmul_precision("high")
 
 from dataset import build_dataset
 from model import build_model
+from augment import elastic_augment_gpu
 
 
 # ---------------------------------------------------------------------------
@@ -41,28 +45,56 @@ def center_crop(t: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     return t
 
 
-def mask_loss(pred, target, gamma=2.0, pos_weight=None):
-    """Sigmoid focal loss — automatically down-weights easy examples.
-    pos_weight: scalar upweight for positive (synapse) examples, e.g. 50.0
+def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_scale=1.0):
+    """Sigmoid focal loss with optional per-crop BalanceLabels-style weighting.
+
+    balance=False (default): use fixed scalar pos_weight (original behaviour).
+    balance=True: compute per-crop frequency weights like gp.BalanceLabels —
+        w_pos = (n_total / (2 * n_pos)) * balance_scale
+        w_neg =  n_total / (2 * n_neg)
+        balance_scale=1.0 → equal gradient contribution from pos and neg voxels
+        balance_scale>1.0 → bias toward recall (more penalty on false negatives)
+        balance_scale<1.0 → bias toward precision
     """
     target = center_crop(target, pred.shape)
-    pw = torch.tensor([pos_weight], device=pred.device, dtype=pred.dtype) if pos_weight else None
+
+    if balance:
+        # compute weights in float32 to avoid float16 overflow under AMP
+        target_f32 = target.float()
+        n_pos   = target_f32.sum().item()
+        n_neg   = (1.0 - target_f32).sum().item()
+        n_total = n_pos + n_neg
+        # guard: if crop is empty of positives, use uniform weights
+        if n_pos < 1.0:
+            weight = torch.ones_like(target)
+        else:
+            w_pos = float(min((n_total / (2.0 * n_pos)) * balance_scale, 100.0))
+            w_neg = float(min( n_total / (2.0 * max(n_neg, 1.0)),        100.0))
+            weight = target_f32 * w_pos + (1.0 - target_f32) * w_neg
+        ce = nn.functional.binary_cross_entropy_with_logits(
+            pred, target, weight=weight, reduction='none'
+        )
+    else:
+        pw = torch.tensor([pos_weight], device=pred.device, dtype=pred.dtype) if pos_weight else None
+        ce = nn.functional.binary_cross_entropy_with_logits(
+            pred, target, pos_weight=pw, reduction='none'
+        )
+
     p   = torch.sigmoid(pred)
-    ce  = nn.functional.binary_cross_entropy_with_logits(pred, target, pos_weight=pw, reduction='none')
     p_t = target * p + (1.0 - target) * (1.0 - p)
     return (((1.0 - p_t) ** gamma) * ce).mean()
 
 
 def direction_loss(pred, target, weight_mask, channel_weights=None, normalize_by_magnitude=False):
-    """MSE restricted to synapse blobs, with optional per-channel weighting
-    and optional normalization by GT vector magnitude (makes loss scale-invariant)."""
-    target      = center_crop(target,      pred.shape)
-    weight_mask = center_crop(weight_mask, pred.shape)
+    """MSE restricted to synapse blobs — computed in float32 to avoid float16 overflow."""
+    pred        = pred.float()
+    target      = center_crop(target, pred.shape).float()
+    weight_mask = center_crop(weight_mask, pred.shape).float()
     diff2 = (pred - target).pow(2) * weight_mask
     if channel_weights is not None:
-        diff2 = diff2 * channel_weights.view(1, -1, 1, 1, 1)
+        diff2 = diff2 * channel_weights.float().view(1, -1, 1, 1, 1)
     if normalize_by_magnitude:
-        gt_mag = target.pow(2).sum(dim=1, keepdim=True).sqrt()
+        gt_mag = target.pow(2).sum(dim=1, keepdim=True).clamp(min=0.0).sqrt()
         diff2 = diff2 / (gt_mag + 1.0)
     n = weight_mask.sum() * pred.shape[1] + 1e-7
     return diff2.sum() / n
@@ -70,8 +102,9 @@ def direction_loss(pred, target, weight_mask, channel_weights=None, normalize_by
 
 def combined_loss(pred_mask, pred_vec, t_mask, t_vec, d_weight,
                   m_scale, d_scale, comb_type, focal_gamma, channel_weights=None,
-                  normalize_by_magnitude=False, pos_weight=None):
-    m_loss = mask_loss(pred_mask, t_mask, focal_gamma, pos_weight)
+                  normalize_by_magnitude=False, pos_weight=None,
+                  balance=False, balance_scale=1.0):
+    m_loss = mask_loss(pred_mask.float(), t_mask.float(), focal_gamma, pos_weight, balance, balance_scale)
     d_loss = direction_loss(pred_vec, t_vec, d_weight, channel_weights, normalize_by_magnitude)
     if comb_type == "sum":
         total = m_scale * m_loss + d_scale * d_loss
@@ -129,6 +162,79 @@ def load_latest_checkpoint(model, optimizer, scaler, scheduler, directory, model
     if "scheduler_state_dict" in state and scheduler is not None:
         scheduler.load_state_dict(state["scheduler_state_dict"])
     return state["iteration"]
+
+
+# ---------------------------------------------------------------------------
+# Tensorboard image logging
+# ---------------------------------------------------------------------------
+
+
+def _stack_to_rgb(vol: np.ndarray) -> np.ndarray:
+    """(Z,Y,X) → (Z,3,Y,X) greyscale-as-RGB, normalised to [0,1]."""
+    lo, hi = vol.min(), vol.max()
+    v = (vol - lo) / max(hi - lo, 1e-8)
+    return np.stack([v, v, v], axis=1).astype(np.float32)
+
+
+def _overlay_stack(raw: np.ndarray, mask: np.ndarray,
+                   color: tuple = (1.0, 0.2, 0.2)) -> np.ndarray:
+    """
+    (Z,Y,X) raw + (Z,Y,X) mask → (Z,3,Y,X) RGB stack, normalised.
+    Mask regions are tinted with `color`.
+    """
+    lo, hi = raw.min(), raw.max()
+    raw_n = (raw - lo) / max(hi - lo, 1e-8)
+    m = np.clip(mask, 0.0, 1.0)
+    r = raw_n * (1 - m) + color[0] * m
+    g = raw_n * (1 - m) + color[1] * m
+    b = raw_n * (1 - m) + color[2] * m
+    return np.stack([r, g, b], axis=1).astype(np.float32)  # (Z,3,Y,X)
+
+
+def log_images(
+    writer:    "SummaryWriter",
+    batch:     dict,
+    pred_mask: torch.Tensor,
+    pred_vec:  torch.Tensor,
+    iteration: int,
+) -> None:
+    """Write z-scrollable image stacks to tensorboard (add_images with slider)."""
+    pred_sh = pred_mask.shape[2:]   # (Z, Y, X)
+
+    def _crop_np(arr):
+        slices = [slice(None)] * (arr.ndim - 3)
+        for a, t in zip(arr.shape[-3:], pred_sh):
+            s = (a - t) // 2
+            slices.append(slice(s, s + t))
+        return arr[tuple(slices)]
+
+    raw_np  = _crop_np(batch["raw"][0, 0].cpu().numpy())
+    gt_mask = _crop_np(batch["indicator_mask"][0, 0].cpu().numpy())
+    gt_vec  = _crop_np(batch["direction_vectors"][0].cpu().numpy())
+
+    p_mask = torch.sigmoid(pred_mask[0, 0]).detach().cpu().float().numpy()
+    p_vec  = pred_vec[0].detach().cpu().float().numpy()
+
+    # raw EM — greyscale z-stack slider
+    writer.add_images("raw",            _stack_to_rgb(raw_np),  iteration)
+
+    # standalone mask sliders
+    writer.add_images("gt/indicator",   _stack_to_rgb(gt_mask), iteration)
+    writer.add_images("pred/indicator", _stack_to_rgb(p_mask),  iteration)
+
+    # overlays: GT=red, pred=green on raw EM
+    writer.add_images("overlay/gt_on_raw",   _overlay_stack(raw_np, gt_mask, color=(1.0, 0.2, 0.2)), iteration)
+    writer.add_images("overlay/pred_on_raw", _overlay_stack(raw_np, p_mask,  color=(0.2, 1.0, 0.2)), iteration)
+
+    # vector magnitude sliders
+    gt_mag = np.sqrt((gt_vec ** 2).sum(axis=0))   # (Z,Y,X)
+    p_mag  = np.sqrt((p_vec  ** 2).sum(axis=0))
+    writer.add_images("gt/vec_mag",   _stack_to_rgb(gt_mag), iteration)
+    writer.add_images("pred/vec_mag", _stack_to_rgb(p_mag),  iteration)
+
+    # per-axis GT vector components
+    for i, ax in enumerate(["z", "y", "x"]):
+        writer.add_images(f"gt/vec_{ax}", _stack_to_rgb(gt_vec[i]), iteration)
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +307,14 @@ def train(params_path: str) -> None:
     # ---- model ------------------------------------------------------------
     model = build_model(params).to(device)
 
-    # torch.compile — matches train_gb.py
-    print("[train] Compiling model with torch.compile ...")
-    model = torch.compile(model)
+    # torch.compile — optional, off by default (inductor can allocate huge intermediate
+    # buffers during training that cause OOM after a few thousand iterations)
+    if params.get("compile", False):
+        compile_mode = params.get("compile_mode", "default")
+        print(f"[train] Compiling model with torch.compile (mode={compile_mode}) ...")
+        model = torch.compile(model, mode=compile_mode)
+    else:
+        print("[train] torch.compile disabled")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] Model parameters: {n_params:,}")
@@ -258,6 +369,15 @@ def train(params_path: str) -> None:
         persistent_workers=True,
     )
 
+    # ---- GPU elastic augmentation -----------------------------------------
+    gpu_elastic     = bool(params.get("gpu_elastic", False))
+    elastic_cfg     = params.get("augmentation", {}).get("elastic", {})
+    elastic_cps     = elastic_cfg.get("control_point_spacing", [50, 10, 10])
+    elastic_sigma   = elastic_cfg.get("jitter_sigma",          [0, 4.0, 4.0])
+    elastic_pslip   = elastic_cfg.get("prob_slip",             0.25)
+    elastic_pshift  = elastic_cfg.get("prob_shift",            0.25)
+    elastic_pelastic= elastic_cfg.get("prob_elastic", elastic_cfg.get("apply_prob", 0.2))
+
     # ---- loss hyper-params ------------------------------------------------
     m_scale     = float(params.get("m_loss_scale", 1.0))
     d_scale     = float(params.get("d_loss_scale", 1.0))
@@ -269,23 +389,100 @@ def train(params_path: str) -> None:
     _cw = params.get("vec_channel_weights", [1.0, 1.0, 1.0])
     channel_weights = torch.tensor(_cw, dtype=torch.float32).to(device)
     normalize_by_magnitude = bool(params.get("vec_normalize_by_magnitude", False))
-    pos_weight = params.get("mask_pos_weight", None)
+    pos_weight    = params.get("mask_pos_weight", None)
     if pos_weight is not None:
         pos_weight = float(pos_weight)
+    balance       = bool(params.get("balance_labels", False))
+    balance_scale = float(params.get("balance_scale", 1.0))
 
     # ---- tensorboard ------------------------------------------------------
-    writer = SummaryWriter(params.get("tensorboard_dir", "tensorboard"))
+    tb_dir = params.get("tensorboard_dir", "tensorboard")
+    writer = SummaryWriter(tb_dir)
 
-    save_every     = params.get("save_every",     10_000)
-    log_every      = params.get("log_every",      100)
-    snapshot_every = params.get("snapshot_every", 25_000)
+    save_every      = params.get("save_every",      10_000)
+    log_every       = params.get("log_every",       100)
+    snapshot_every  = params.get("snapshot_every",  25_000)
+    hist_every      = params.get("hist_every",      2_000)   # grad/weight histograms
+
+    # ---- tensorboard: model graph -----------------------------------------
+    # Logged once at the very start (or resume). Uses a dummy input on CPU to
+    # avoid perturbing the training device state.
+    try:
+        _dummy = torch.zeros(1, 1, *params["input_size"], dtype=torch.float32)
+        _graph_model = build_model(params)   # fresh uncompiled copy — add_graph needs hooks
+        writer.add_graph(_graph_model, _dummy)
+        del _dummy, _graph_model
+        print("[train] Model graph written to TensorBoard.")
+    except Exception as _e:
+        print(f"[train] WARNING: add_graph failed ({_e}) — skipping graph.")
+
+    # ---- tensorboard: custom scalars layout --------------------------------
+    # Groups scalars into named panels in the TensorBoard UI.
+    from torch.utils.tensorboard.summary import custom_scalar_layout
+    layout = {
+        "Loss": {
+            "total + smoothed":  ["Multiline", ["loss/total", "loss/total_ema"]],
+            "components":        ["Multiline", ["loss/mask",  "loss/direction"]],
+        },
+        "Gradient": {
+            "global norm":       ["Multiline", ["grad/global_norm"]],
+            "max layer norm":    ["Multiline", ["grad/max_layer_norm"]],
+        },
+        "Training": {
+            "learning rate":     ["Multiline", ["lr"]],
+            "amp scale":         ["Multiline", ["amp/scale"]],
+            "throughput (it/s)": ["Multiline", ["perf/iter_per_sec"]],
+        },
+        "Data": {
+            "positive voxel fraction": ["Multiline", ["data/pos_vox_frac"]],
+        },
+        "Predictions": {
+            "vec magnitude (mean)": ["Multiline",
+                                     ["pred/vec_mag_z", "pred/vec_mag_y", "pred/vec_mag_x"]],
+        },
+    }
+    writer.add_custom_scalars(layout)
+
+    # ---- tensorboard: hyperparameters -------------------------------------
+    # Flatten the params dict to scalar hparams TensorBoard can display.
+    _hparam_keys = [
+        "learning_rate", "batch_size", "fmap_num", "fmap_inc_factor",
+        "m_loss_scale", "d_loss_scale", "focal_gamma", "balance_labels",
+        "balance_scale", "mask_pos_weight", "warmup_steps", "cosine_period",
+        "final_div_factor", "grad_clip", "use_amp", "gpu_elastic",
+        "num_data_workers", "kernel_size", "norm_type",
+    ]
+    hparams = {k: params[k] for k in _hparam_keys if k in params}
+    # Booleans must be cast to int for TensorBoard hparam display
+    hparams = {k: (int(v) if isinstance(v, bool) else v)
+               for k, v in hparams.items() if isinstance(v, (int, float, str, bool))}
+    # We'll call writer.add_hparams at the end of training with final metric values.
 
     # ---- loop -------------------------------------------------------------
     iteration = start_iter
     model.train()
     data_iter = iter(loader)
 
+    # Apply gamma schedule immediately if resuming past the scheduled step.
+    _gamma_applied = False
+    if _gamma_schedule and iteration >= _gamma_schedule["step"]:
+        focal_gamma = float(_gamma_schedule["gamma"])
+        _gamma_applied = True
+        print(f"[train] focal_gamma → {focal_gamma} (schedule already passed at iter {_gamma_schedule['step']})")
+
     print(f"[train] Starting from iteration {iteration} / {max_iter}")
+    if balance:
+        print(f"[train] balance_labels=True  balance_scale={balance_scale}  (pos_weight ignored)")
+    else:
+        print(f"[train] balance_labels=False  pos_weight={pos_weight}")
+
+    import time as _time
+    _loss_ema   = None          # exponential moving average of total loss
+    _ema_alpha  = 0.98          # smoothing factor (higher = smoother)
+    _t_last     = _time.perf_counter()
+    _iters_since_log = 0
+
+    grad_clip = params.get("grad_clip", 1.0)
 
     while iteration < max_iter:
         try:
@@ -299,9 +496,21 @@ def train(params_path: str) -> None:
         t_vec    = batch["direction_vectors"].to(device, non_blocking=True)
         d_weight = batch["d_weight_mask"].to(device, non_blocking=True)
 
-        # Apply gamma schedule if configured
-        if _gamma_schedule and iteration == _gamma_schedule["step"]:
+        if gpu_elastic:
+            with torch.no_grad():
+                raw, t_mask, t_vec, d_weight = elastic_augment_gpu(
+                    raw, t_mask, t_vec, d_weight,
+                    control_point_spacing = elastic_cps,
+                    jitter_sigma          = elastic_sigma,
+                    prob_slip             = elastic_pslip,
+                    prob_shift            = elastic_pshift,
+                    prob_elastic          = elastic_pelastic,
+                )
+
+        # Apply gamma schedule if configured (fires exactly once at the step boundary)
+        if _gamma_schedule and not _gamma_applied and iteration >= _gamma_schedule["step"]:
             focal_gamma = float(_gamma_schedule["gamma"])
+            _gamma_applied = True
             print(f"[train] focal_gamma → {focal_gamma} at iteration {iteration}")
             writer.add_scalar("focal_gamma", focal_gamma, iteration)
 
@@ -313,33 +522,120 @@ def train(params_path: str) -> None:
                 pred_mask, pred_vec, t_mask, t_vec, d_weight,
                 m_scale, d_scale, comb_type, focal_gamma, channel_weights,
                 normalize_by_magnitude, pos_weight,
+                balance, balance_scale,
             )
+
+        loss_val = loss.item()
+        if not math.isfinite(loss_val):
+            print(f"[train] WARNING: non-finite loss={loss_val:.4g} at iter {iteration} "
+                  f"(mask={m_loss.item():.4g} vec={d_loss.item():.4g}) — skipping batch")
+            optimizer.zero_grad(set_to_none=True)
+            # scaler.update() must always be called so the scale factor can decrease
+            # after a nan/inf, preventing repeated skips at the same inflated scale.
+            scaler.update()
+            iteration += 1
+            _iters_since_log += 1
+            continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=params.get("grad_clip", 1.0))
+
+        # compute grad norm before clipping (what we'd have clipped from)
+        raw_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
 
         iteration += 1
+        _iters_since_log += 1
+
+        # update EMA
+        if _loss_ema is None:
+            _loss_ema = loss_val
+        else:
+            _loss_ema = _ema_alpha * _loss_ema + (1.0 - _ema_alpha) * loss_val
 
         if iteration % log_every == 0:
-            l, ml, dl = loss.item(), m_loss.item(), d_loss.item()
+            l, ml, dl = loss_val, m_loss.item(), d_loss.item()
             lr = scheduler.get_last_lr()[0]
-            print(f"[{iteration:>8}/{max_iter}]  loss={l:.5f}  mask={ml:.5f}  vec={dl:.5f}  lr={lr:.2e}")
-            writer.add_scalar("loss/total",     l,  iteration)
-            writer.add_scalar("loss/mask",      ml, iteration)
-            writer.add_scalar("loss/direction", dl, iteration)
-            writer.add_scalar("lr",             lr, iteration)
+
+            _t_now   = _time.perf_counter()
+            elapsed  = max(_t_now - _t_last, 1e-6)
+            it_per_s = _iters_since_log / elapsed
+            _t_last  = _t_now
+            _iters_since_log = 0
+
+            print(f"[{iteration:>8}/{max_iter}]  loss={l:.5f}  ema={_loss_ema:.5f}  "
+                  f"mask={ml:.5f}  vec={dl:.5f}  lr={lr:.2e}  "
+                  f"gnorm={raw_grad_norm:.3f}  {it_per_s:.1f}it/s")
+
+            # ---- scalar logging ----
+            writer.add_scalar("loss/total",        l,           iteration)
+            writer.add_scalar("loss/total_ema",    _loss_ema,   iteration)
+            writer.add_scalar("loss/mask",         ml,          iteration)
+            writer.add_scalar("loss/direction",    dl,          iteration)
+            writer.add_scalar("lr",                lr,          iteration)
+            writer.add_scalar("grad/global_norm",  float(raw_grad_norm), iteration)
+            writer.add_scalar("amp/scale",         scaler.get_scale(),   iteration)
+            writer.add_scalar("perf/iter_per_sec", it_per_s,    iteration)
+
+            # positive voxel fraction in GT mask (measures class imbalance)
+            pos_frac = center_crop(t_mask, pred_mask.shape).float().mean().item()
+            writer.add_scalar("data/pos_vox_frac", pos_frac, iteration)
+
+            # mean predicted vector magnitude per axis
+            with torch.no_grad():
+                pv = pred_vec.float().detach()
+                writer.add_scalar("pred/vec_mag_z", pv[:, 0].abs().mean().item(), iteration)
+                writer.add_scalar("pred/vec_mag_y", pv[:, 1].abs().mean().item(), iteration)
+                writer.add_scalar("pred/vec_mag_x", pv[:, 2].abs().mean().item(), iteration)
+
+        if iteration % hist_every == 0:
+            # ---- weight and gradient histograms ----
+            # Per named parameter: log weight distribution and grad distribution.
+            # Also track per-layer grad norms to spot vanishing/exploding layers.
+            max_layer_norm = 0.0
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    safe = name.replace(".", "/")
+                    writer.add_histogram(f"weights/{safe}", param.detach().float(), iteration)
+                    if param.grad is not None:
+                        g = param.grad.detach().float()
+                        writer.add_histogram(f"grads/{safe}", g, iteration)
+                        layer_norm = g.norm().item()
+                        max_layer_norm = max(max_layer_norm, layer_norm)
+            writer.add_scalar("grad/max_layer_norm", max_layer_norm, iteration)
 
         if iteration % snapshot_every == 0:
             save_snapshot(batch, pred_mask, pred_vec, iteration, snapshot_dir)
+            log_images(writer, batch, pred_mask, pred_vec, iteration)
+
+            # ---- PR curve (precision-recall) from this batch ----
+            with torch.no_grad():
+                _pm = center_crop(pred_mask, pred_mask.shape)  # already full size
+                _gt = center_crop(t_mask, pred_mask.shape)
+                _probs  = torch.sigmoid(_pm).float().cpu().flatten()
+                _labels = _gt.float().cpu().flatten().long()
+                writer.add_pr_curve("pr/indicator", _labels, _probs, iteration)
 
         if iteration % save_every == 0:
             save_checkpoint(model, optimizer, scaler, scheduler, iteration, snapshot_dir, model_name)
 
     save_checkpoint(model, optimizer, scaler, scheduler, iteration, snapshot_dir, model_name)
+
+    # ---- final hparams entry -----------------------------------------------
+    # Links the run's hyperparameters to its final metrics in the HPARAMS tab.
+    writer.add_hparams(
+        hparams,
+        {
+            "hparam/final_loss":      loss_val,
+            "hparam/final_loss_ema":  _loss_ema if _loss_ema is not None else loss_val,
+            "hparam/final_mask_loss": m_loss.item(),
+            "hparam/final_vec_loss":  d_loss.item(),
+        },
+    )
+
     writer.close()
     print("[train] Done.")
 
